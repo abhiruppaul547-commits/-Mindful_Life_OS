@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "./dist",
+    "rootDir": ".",
+    "strict": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["demoui.tsx"]
+}
