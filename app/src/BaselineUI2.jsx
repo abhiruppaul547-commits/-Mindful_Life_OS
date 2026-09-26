@@ -41,7 +41,7 @@ import {
   sendPasswordResetEmail,
   signOut,
 } from "firebase/auth";
-import { doc, getDoc, setDoc } from "firebase/firestore";
+import { ref, get, set, onValue } from "firebase/database";
 import { auth, db } from "./firebase.js";
 
 // --- Utilities ---
@@ -428,9 +428,8 @@ export default function App() {
       setUser(nextUser);
       if (nextUser) {
         try {
-          const cfgSnap = await getDoc(
-            doc(db, "users", nextUser.uid, "config", "main"),
-          );
+          const cfgRef = ref(db, `users/${nextUser.uid}/config/main`);
+          const cfgSnap = await get(cfgRef);
           if (!cfgSnap.exists()) {
             setCurrentView("onboarding");
           }
@@ -526,7 +525,7 @@ export default function App() {
 }
 
 // ==========================================
-// 1. TIME-BLOCK TIMETABLE DASHBOARD (FIRESTORE)
+// 1. TIME-BLOCK TIMETABLE DASHBOARD (REALTIME DATABASE)
 // ==========================================
 function TimeblockTimetableDashboard({ user, onConfigure, onLogout }) {
   const [config, setConfig] = useState(null);
@@ -562,63 +561,67 @@ function TimeblockTimetableDashboard({ user, onConfigure, onLogout }) {
     return () => clearInterval(interval);
   }, []);
 
-  // 1. Fetch User Config from Firestore
+  // 1. Real-time User Config from Realtime Database
   useEffect(() => {
     if (!user) return;
-    let isMounted = true;
+    const cfgRef = ref(db, `users/${user.uid}/config/main`);
+    let isInitializing = false;
 
-    async function loadConfig() {
-      try {
-        const cfgRef = doc(db, "users", user.uid, "config", "main");
-        const cfgSnap = await getDoc(cfgRef);
-        if (cfgSnap.exists()) {
-          if (isMounted) setConfig(cfgSnap.data());
+    const unsubscribe = onValue(
+      cfgRef,
+      async (snapshot) => {
+        if (snapshot.exists() && snapshot.val()) {
+          setConfig(snapshot.val());
+          setLoadingConfig(false);
         } else {
-          await setDoc(cfgRef, DEFAULT_CONFIG);
-          if (isMounted) setConfig(DEFAULT_CONFIG);
+          if (isInitializing) return;
+          isInitializing = true;
+          try {
+            await set(cfgRef, DEFAULT_CONFIG);
+            setConfig(DEFAULT_CONFIG);
+          } catch (err) {
+            console.error("Error setting default config:", err);
+            setConfig(DEFAULT_CONFIG);
+          } finally {
+            setLoadingConfig(false);
+          }
         }
-      } catch (err) {
-        console.error("Error loading config from Firestore:", err);
-        if (isMounted) setConfig(DEFAULT_CONFIG);
-      } finally {
-        if (isMounted) setLoadingConfig(false);
+      },
+      (err) => {
+        console.error("Error loading config from Realtime Database:", err);
+        setConfig(DEFAULT_CONFIG);
+        setLoadingConfig(false);
       }
-    }
+    );
 
-    loadConfig();
-    return () => {
-      isMounted = false;
-    };
+    return () => unsubscribe();
   }, [user]);
 
-  // 2. Fetch or Generate Daily Tasks from Firestore
+  // 2. Real-time Daily Tasks from Realtime Database
   useEffect(() => {
     if (!user || !config) return;
-    let isMounted = true;
+    setLoadingTasks(true);
+    const dayShort = DAYS_SHORT[selectedDayIndex];
+    const taskRef = ref(
+      db,
+      `users/${user.uid}/dailyTasks/${selectedDayIndex}`
+    );
+    let isGenerating = false;
 
-    async function loadDayTasks() {
-      setLoadingTasks(true);
-      const dayShort = DAYS_SHORT[selectedDayIndex];
-      const taskDocRef = doc(
-        db,
-        "users",
-        user.uid,
-        "dailyTasks",
-        String(selectedDayIndex),
-      );
-
-      try {
-        const taskSnap = await getDoc(taskDocRef);
-        if (taskSnap.exists() && taskSnap.data().tasks) {
-          if (isMounted) {
-            setTasksMap((prev) => ({
-              ...prev,
-              [selectedDayIndex]: taskSnap.data().tasks,
-            }));
-            setLoadingTasks(false);
-          }
+    const unsubscribe = onValue(
+      taskRef,
+      async (snapshot) => {
+        if (snapshot.exists() && snapshot.val()?.tasks) {
+          setTasksMap((prev) => ({
+            ...prev,
+            [selectedDayIndex]: snapshot.val().tasks,
+          }));
+          setLoadingTasks(false);
           return;
         }
+
+        if (isGenerating) return;
+        isGenerating = true;
 
         // Generate schedule from config
         const generatedTasks = [];
@@ -698,47 +701,44 @@ function TimeblockTimetableDashboard({ user, onConfigure, onLogout }) {
 
         generatedTasks.sort((a, b) => a.startTime.localeCompare(b.startTime));
 
-        // Save generated day to Firestore
-        await setDoc(taskDocRef, { tasks: generatedTasks });
-
-        if (isMounted) {
-          setTasksMap((prev) => ({
-            ...prev,
-            [selectedDayIndex]: generatedTasks,
-          }));
-          setLoadingTasks(false);
+        // Save generated day to Realtime Database
+        try {
+          await set(taskRef, { tasks: generatedTasks });
+        } catch (err) {
+          console.error("Error saving day tasks to Realtime Database:", err);
         }
-      } catch (err) {
-        console.error("Error loading day tasks from Firestore:", err);
-        if (isMounted) setLoadingTasks(false);
-      }
-    }
 
-    loadDayTasks();
-    return () => {
-      isMounted = false;
-    };
+        setTasksMap((prev) => ({
+          ...prev,
+          [selectedDayIndex]: generatedTasks,
+        }));
+        setLoadingTasks(false);
+      },
+      (err) => {
+        console.error("Error loading day tasks from Realtime Database:", err);
+        setLoadingTasks(false);
+      }
+    );
+
+    return () => unsubscribe();
   }, [selectedDayIndex, config, user]);
 
   const currentDayTasks = useMemo(() => {
     return tasksMap[selectedDayIndex] || [];
   }, [tasksMap, selectedDayIndex]);
 
-  // Save changes to Firestore and update local state
+  // Save changes to Realtime Database and update local state
   const persistTasks = async (updated) => {
     setTasksMap((prev) => ({ ...prev, [selectedDayIndex]: updated }));
     if (!user) return;
     try {
-      const taskDocRef = doc(
+      const taskRef = ref(
         db,
-        "users",
-        user.uid,
-        "dailyTasks",
-        String(selectedDayIndex),
+        `users/${user.uid}/dailyTasks/${selectedDayIndex}`
       );
-      await setDoc(taskDocRef, { tasks: updated });
+      await set(taskRef, { tasks: updated });
     } catch (err) {
-      console.error("Error syncing tasks to Firestore:", err);
+      console.error("Error syncing tasks to Realtime Database:", err);
     }
   };
 
@@ -1536,7 +1536,7 @@ function TimeblockTimetableDashboard({ user, onConfigure, onLogout }) {
 }
 
 // ==========================================
-// 2. MASTER SETUP WIZARD (FIRESTORE SYNC)
+// 2. MASTER SETUP WIZARD (REALTIME DATABASE SYNC)
 // ==========================================
 function MasterSetupWizard({ user, onComplete, onCancel }) {
   const [step, setStep] = useState(1);
@@ -1553,11 +1553,10 @@ function MasterSetupWizard({ user, onComplete, onCancel }) {
 
     async function fetchUserConfig() {
       try {
-        const cfgSnap = await getDoc(
-          doc(db, "users", user.uid, "config", "main"),
-        );
+        const cfgRef = ref(db, `users/${user.uid}/config/main`);
+        const cfgSnap = await get(cfgRef);
         if (cfgSnap.exists()) {
-          const data = cfgSnap.data();
+          const data = cfgSnap.val();
           if (isMounted) {
             if (data.commitments) setCommitments(data.commitments);
             if (data.training) setTraining(data.training);
@@ -1565,7 +1564,7 @@ function MasterSetupWizard({ user, onComplete, onCancel }) {
           }
         }
       } catch (err) {
-        console.error("Error fetching wizard config from Firestore:", err);
+        console.error("Error fetching wizard config from Realtime Database:", err);
       } finally {
         if (isMounted) setLoadingConfig(false);
       }
@@ -1586,8 +1585,9 @@ function MasterSetupWizard({ user, onComplete, onCancel }) {
 
     try {
       if (user) {
-        // Save Master Configuration
-        await setDoc(doc(db, "users", user.uid, "config", "main"), {
+        // Save Master Configuration under /users/{userId}/config/main
+        const cfgRef = ref(db, `users/${user.uid}/config/main`);
+        await set(cfgRef, {
           commitments,
           training,
           recovery,
@@ -1595,14 +1595,14 @@ function MasterSetupWizard({ user, onComplete, onCancel }) {
 
         // Clear existing generated daily tasks so they re-synthesize cleanly
         const clearPromises = DAYS_SHORT.map((_, idx) =>
-          setDoc(doc(db, "users", user.uid, "dailyTasks", String(idx)), {
+          set(ref(db, `users/${user.uid}/dailyTasks/${idx}`), {
             tasks: null,
           }),
         );
         await Promise.all(clearPromises);
       }
     } catch (err) {
-      console.error("Error saving synthesized protocol:", err);
+      console.error("Error saving synthesized protocol to Realtime Database:", err);
     } finally {
       setTimeout(() => {
         setIsSynthesizing(false);
@@ -1997,8 +1997,8 @@ function MasterSetupWizard({ user, onComplete, onCancel }) {
                 <div className="space-y-4">
                   <div className="w-16 h-16 rounded-full border-4 border-violet-500/20 border-t-violet-500 animate-spin mx-auto" />
                   <p className="font-mono text-sm text-zinc-400 animate-pulse">
-                    Synthesizing weekly time-block protocol to Cloud
-                    Firestore...
+                    Synthesizing weekly time-block protocol to Realtime
+                    Database...
                   </p>
                 </div>
               ) : (
