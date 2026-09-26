@@ -1,7 +1,7 @@
-import MindfulLifeOnboarding from "./MindfulLifeOnboarding.jsx";
+import BaselineUI2 from "./BaselineUI2.jsx";
 
 function App() {
-  return <MindfulLifeOnboarding />;
+  return <BaselineUI2 />;
 }
 
 export default App;

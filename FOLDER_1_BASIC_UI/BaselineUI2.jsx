@@ -41,7 +41,8 @@ import {
   sendPasswordResetEmail,
   signOut,
 } from "firebase/auth";
-import { auth } from "./src/firebase.js";
+import { doc, getDoc, setDoc } from "firebase/firestore";
+import { auth, db } from "./src/firebase.js";
 
 // --- Utilities ---
 function cn(...inputs) {
@@ -208,7 +209,7 @@ const ParticleBackground = () => {
 };
 
 // ==========================================
-// MAIN COMPONENT EXPORT
+// AUTHENTICATION & LOGIN SCREEN
 // ==========================================
 function mapAuthError(error) {
   switch (error?.code) {
@@ -415,18 +416,28 @@ function LoginScreen() {
 }
 
 // ==========================================
-// MAIN COMPONENT EXPORT
+// MAIN COMPONENT ROOT
 // ==========================================
 export default function App() {
-  const [currentView, setCurrentView] = useState(() => {
-    return localStorage.getItem("mindfulOS_config") ? "dashboard" : "dashboard";
-  });
+  const [currentView, setCurrentView] = useState("dashboard");
   const [user, setUser] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (nextUser) => {
+    const unsubscribe = onAuthStateChanged(auth, async (nextUser) => {
       setUser(nextUser);
+      if (nextUser) {
+        try {
+          const cfgSnap = await getDoc(
+            doc(db, "users", nextUser.uid, "config", "main"),
+          );
+          if (!cfgSnap.exists()) {
+            setCurrentView("onboarding");
+          }
+        } catch (e) {
+          console.error("Failed to check user config:", e);
+        }
+      }
       setAuthLoading(false);
     });
     return unsubscribe;
@@ -489,6 +500,7 @@ export default function App() {
             transition={{ duration: 0.25 }}
           >
             <MasterSetupWizard
+              user={user}
               onComplete={() => setCurrentView("dashboard")}
               onCancel={() => setCurrentView("dashboard")}
             />
@@ -502,6 +514,7 @@ export default function App() {
             transition={{ duration: 0.25 }}
           >
             <TimeblockTimetableDashboard
+              user={user}
               onConfigure={() => setCurrentView("onboarding")}
               onLogout={handleLogout}
             />
@@ -513,13 +526,12 @@ export default function App() {
 }
 
 // ==========================================
-// 1. TIME-BLOCK TIMETABLE DASHBOARD
+// 1. TIME-BLOCK TIMETABLE DASHBOARD (FIRESTORE)
 // ==========================================
-function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
-  const [config, setConfig] = useState(() => {
-    const saved = localStorage.getItem("mindfulOS_config");
-    return saved ? JSON.parse(saved) : DEFAULT_CONFIG;
-  });
+function TimeblockTimetableDashboard({ user, onConfigure, onLogout }) {
+  const [config, setConfig] = useState(null);
+  const [loadingConfig, setLoadingConfig] = useState(true);
+  const [loadingTasks, setLoadingTasks] = useState(true);
 
   const [selectedDayIndex, setSelectedDayIndex] = useState(new Date().getDay());
   const [currentTime, setCurrentTime] = useState(getCurrentTimeString());
@@ -527,7 +539,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
   const [tasksMap, setTasksMap] = useState({});
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
 
-  // New task form state
   const [newTask, setNewTask] = useState({
     title: "",
     type: "DeepWork",
@@ -539,7 +550,7 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
   const todayIndex = new Date().getDay();
   const isSelectedDayToday = selectedDayIndex === todayIndex;
 
-  // Real-time clock interval (every second for fluid countdown & accuracy)
+  // Real-time clock interval
   useEffect(() => {
     const interval = setInterval(() => {
       const now = new Date();
@@ -551,142 +562,198 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
     return () => clearInterval(interval);
   }, []);
 
-  // Save config to storage if not present
+  // 1. Fetch User Config from Firestore
   useEffect(() => {
-    if (!localStorage.getItem("mindfulOS_config")) {
-      localStorage.setItem("mindfulOS_config", JSON.stringify(DEFAULT_CONFIG));
-    }
-  }, []);
+    if (!user) return;
+    let isMounted = true;
 
-  // Generate or load daily tasks for selected day
-  useEffect(() => {
-    const dayShort = DAYS_SHORT[selectedDayIndex];
-    const storageKey = `mindfulOS_tasks_day_${selectedDayIndex}`;
-    const saved = localStorage.getItem(storageKey);
-
-    if (saved) {
+    async function loadConfig() {
       try {
-        setTasksMap((prev) => ({
-          ...prev,
-          [selectedDayIndex]: JSON.parse(saved),
-        }));
-        return;
-      } catch (e) {
-        console.error(e);
+        const cfgRef = doc(db, "users", user.uid, "config", "main");
+        const cfgSnap = await getDoc(cfgRef);
+        if (cfgSnap.exists()) {
+          if (isMounted) setConfig(cfgSnap.data());
+        } else {
+          await setDoc(cfgRef, DEFAULT_CONFIG);
+          if (isMounted) setConfig(DEFAULT_CONFIG);
+        }
+      } catch (err) {
+        console.error("Error loading config from Firestore:", err);
+        if (isMounted) setConfig(DEFAULT_CONFIG);
+      } finally {
+        if (isMounted) setLoadingConfig(false);
       }
     }
 
-    // Otherwise generate schedule from config
-    const generatedTasks = [];
+    loadConfig();
+    return () => {
+      isMounted = false;
+    };
+  }, [user]);
 
-    // 1. Morning Routine Anchor
-    const wakeTime = config.recovery?.targetWakeTime || "07:00";
-    generatedTasks.push({
-      id: "morning-routine",
-      title: "Circadian Wakeup & Morning Protocol",
-      type: "Routine",
-      startTime: wakeTime,
-      endTime: addMinutes(wakeTime, 45),
-      completed: false,
-      notes: "Hydration, light exposure, cold plunge/shower, planning",
-    });
+  // 2. Fetch or Generate Daily Tasks from Firestore
+  useEffect(() => {
+    if (!user || !config) return;
+    let isMounted = true;
 
-    // 2. Commitments
-    (config.commitments || []).forEach((c) => {
-      if (c.days.includes(dayShort)) {
-        generatedTasks.push({
-          id: c.id,
-          title: c.title,
-          type: c.type,
-          startTime: c.startTime,
-          endTime: c.endTime,
-          completed: false,
-          notes: `${c.type} priority session`,
-        });
-      }
-    });
-
-    // 3. Training
-    if ((config.training?.workoutDays || []).includes(dayShort)) {
-      const trainStart = config.training.preferredTime || "17:15";
-      const trainEnd = addMinutes(
-        trainStart,
-        config.training.durationMinutes || 60,
+    async function loadDayTasks() {
+      setLoadingTasks(true);
+      const dayShort = DAYS_SHORT[selectedDayIndex];
+      const taskDocRef = doc(
+        db,
+        "users",
+        user.uid,
+        "dailyTasks",
+        String(selectedDayIndex),
       );
-      generatedTasks.push({
-        id: "training",
-        title: `${config.training.split || "Physical"} Regimen`,
-        type: "Training",
-        startTime: trainStart,
-        endTime: trainEnd,
-        completed: false,
-        notes: `Intensity focus • ${config.training.durationMinutes || 60} min session`,
-      });
+
+      try {
+        const taskSnap = await getDoc(taskDocRef);
+        if (taskSnap.exists() && taskSnap.data().tasks) {
+          if (isMounted) {
+            setTasksMap((prev) => ({
+              ...prev,
+              [selectedDayIndex]: taskSnap.data().tasks,
+            }));
+            setLoadingTasks(false);
+          }
+          return;
+        }
+
+        // Generate schedule from config
+        const generatedTasks = [];
+
+        // Circadian Wake
+        const wakeTime = config.recovery?.targetWakeTime || "07:00";
+        generatedTasks.push({
+          id: "morning-routine",
+          title: "Circadian Wakeup & Morning Protocol",
+          type: "Routine",
+          startTime: wakeTime,
+          endTime: addMinutes(wakeTime, 45),
+          completed: false,
+          notes: "Hydration, light exposure, cold plunge/shower, planning",
+        });
+
+        // Commitments
+        (config.commitments || []).forEach((c) => {
+          if (c.days.includes(dayShort)) {
+            generatedTasks.push({
+              id: c.id,
+              title: c.title,
+              type: c.type,
+              startTime: c.startTime,
+              endTime: c.endTime,
+              completed: false,
+              notes: `${c.type} priority session`,
+            });
+          }
+        });
+
+        // Training
+        if ((config.training?.workoutDays || []).includes(dayShort)) {
+          const trainStart = config.training.preferredTime || "17:15";
+          const trainEnd = addMinutes(
+            trainStart,
+            config.training.durationMinutes || 60,
+          );
+          generatedTasks.push({
+            id: "training",
+            title: `${config.training.split || "Physical"} Regimen`,
+            type: "Training",
+            startTime: trainStart,
+            endTime: trainEnd,
+            completed: false,
+            notes: `Intensity focus • ${config.training.durationMinutes || 60} min session`,
+          });
+        }
+
+        // Deep Work
+        const codeStart = config.recovery?.codingStartTime || "19:30";
+        const codeEnd = addMinutes(
+          codeStart,
+          config.recovery?.codingBlockMinutes || 120,
+        );
+        generatedTasks.push({
+          id: "deep-work",
+          title: "Deep Focus Engineering Block",
+          type: "DeepWork",
+          startTime: codeStart,
+          endTime: codeEnd,
+          completed: false,
+          notes: "High-leverage development, zero distractions, flow state",
+        });
+
+        // Recovery
+        const bedtime = config.recovery?.targetBedtime || "23:15";
+        generatedTasks.push({
+          id: "sleep",
+          title: "Circadian Wind-Down & Sleep Block",
+          type: "Recovery",
+          startTime: bedtime,
+          endTime: "23:59",
+          completed: false,
+          notes: "Dim blue light, magnesium, read, restful sleep cycle",
+        });
+
+        generatedTasks.sort((a, b) => a.startTime.localeCompare(b.startTime));
+
+        // Save generated day to Firestore
+        await setDoc(taskDocRef, { tasks: generatedTasks });
+
+        if (isMounted) {
+          setTasksMap((prev) => ({
+            ...prev,
+            [selectedDayIndex]: generatedTasks,
+          }));
+          setLoadingTasks(false);
+        }
+      } catch (err) {
+        console.error("Error loading day tasks from Firestore:", err);
+        if (isMounted) setLoadingTasks(false);
+      }
     }
 
-    // 4. Deep Work
-    const codeStart = config.recovery?.codingStartTime || "19:30";
-    const codeEnd = addMinutes(
-      codeStart,
-      config.recovery?.codingBlockMinutes || 120,
-    );
-    generatedTasks.push({
-      id: "deep-work",
-      title: "Deep Focus Engineering Block",
-      type: "DeepWork",
-      startTime: codeStart,
-      endTime: codeEnd,
-      completed: false,
-      notes: "High-leverage development, zero distractions, flow state",
-    });
-
-    // 5. Recovery / Sleep
-    const bedtime = config.recovery?.targetBedtime || "23:15";
-    generatedTasks.push({
-      id: "sleep",
-      title: "Circadian Wind-Down & Sleep Block",
-      type: "Recovery",
-      startTime: bedtime,
-      endTime: "23:59",
-      completed: false,
-      notes: "Dim blue light, magnesium, read, restful sleep cycle",
-    });
-
-    // Sort chronologically
-    generatedTasks.sort((a, b) => a.startTime.localeCompare(b.startTime));
-
-    setTasksMap((prev) => ({ ...prev, [selectedDayIndex]: generatedTasks }));
-    localStorage.setItem(storageKey, JSON.stringify(generatedTasks));
-  }, [selectedDayIndex, config]);
+    loadDayTasks();
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedDayIndex, config, user]);
 
   const currentDayTasks = useMemo(() => {
     return tasksMap[selectedDayIndex] || [];
   }, [tasksMap, selectedDayIndex]);
 
-  // Task Completion Toggle
+  // Save changes to Firestore and update local state
+  const persistTasks = async (updated) => {
+    setTasksMap((prev) => ({ ...prev, [selectedDayIndex]: updated }));
+    if (!user) return;
+    try {
+      const taskDocRef = doc(
+        db,
+        "users",
+        user.uid,
+        "dailyTasks",
+        String(selectedDayIndex),
+      );
+      await setDoc(taskDocRef, { tasks: updated });
+    } catch (err) {
+      console.error("Error syncing tasks to Firestore:", err);
+    }
+  };
+
   const toggleTask = (taskId) => {
     const updated = currentDayTasks.map((task) =>
       task.id === taskId ? { ...task, completed: !task.completed } : task,
     );
-
-    setTasksMap((prev) => ({ ...prev, [selectedDayIndex]: updated }));
-    localStorage.setItem(
-      `mindfulOS_tasks_day_${selectedDayIndex}`,
-      JSON.stringify(updated),
-    );
+    persistTasks(updated);
   };
 
-  // Delete Task
   const deleteTask = (taskId) => {
     const updated = currentDayTasks.filter((t) => t.id !== taskId);
-    setTasksMap((prev) => ({ ...prev, [selectedDayIndex]: updated }));
-    localStorage.setItem(
-      `mindfulOS_tasks_day_${selectedDayIndex}`,
-      JSON.stringify(updated),
-    );
+    persistTasks(updated);
   };
 
-  // Add Custom Task
   const handleAddTask = (e) => {
     e.preventDefault();
     if (!newTask.title.trim()) return;
@@ -705,12 +772,7 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
       a.startTime.localeCompare(b.startTime),
     );
 
-    setTasksMap((prev) => ({ ...prev, [selectedDayIndex]: updated }));
-    localStorage.setItem(
-      `mindfulOS_tasks_day_${selectedDayIndex}`,
-      JSON.stringify(updated),
-    );
-
+    persistTasks(updated);
     setNewTask({
       title: "",
       type: "DeepWork",
@@ -721,18 +783,12 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
     setIsAddModalOpen(false);
   };
 
-  // Reset current day's checkboxes
   const handleResetProgress = () => {
     const reset = currentDayTasks.map((t) => ({ ...t, completed: false }));
-    setTasksMap((prev) => ({ ...prev, [selectedDayIndex]: reset }));
-    localStorage.setItem(
-      `mindfulOS_tasks_day_${selectedDayIndex}`,
-      JSON.stringify(reset),
-    );
+    persistTasks(reset);
   };
 
   // Productivity Score Calculation
-  // All tasks except Recovery/Sleep contribute to the daily actionable score
   const actionableTasks = useMemo(() => {
     return currentDayTasks.filter((t) => t.type !== "Recovery");
   }, [currentDayTasks]);
@@ -746,7 +802,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
     return Math.round((completedCount / actionableTasks.length) * 100);
   }, [completedCount, actionableTasks.length]);
 
-  // Duration metrics
   const totalPlannedMinutes = useMemo(() => {
     return actionableTasks.reduce((acc, t) => {
       let diff = timeToMinutes(t.endTime) - timeToMinutes(t.startTime);
@@ -765,7 +820,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
       }, 0);
   }, [actionableTasks]);
 
-  // Find currently active task
   const currentActiveTask = useMemo(() => {
     if (!isSelectedDayToday) return null;
     return currentDayTasks.find((task) => {
@@ -773,7 +827,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
     });
   }, [currentDayTasks, currentTime, isSelectedDayToday]);
 
-  // Remaining minutes in active task
   const activeRemainingMins = useMemo(() => {
     if (!currentActiveTask) return 0;
     const nowMins = timeToMinutes(currentTime);
@@ -783,7 +836,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
     return diff;
   }, [currentActiveTask, currentTime]);
 
-  // Category Theme Mapper
   const getCategoryStyles = (type, isCurrent) => {
     switch (type) {
       case "DeepWork":
@@ -866,14 +918,28 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
 
   const statusObj = getScoreStatus(productivityScore);
 
+  if (loadingConfig) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="text-center space-y-3">
+          <motion.div
+            className="w-12 h-12 rounded-full border-4 border-violet-500/20 border-t-violet-500 mx-auto"
+            animate={{ rotate: 360 }}
+            transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+          />
+          <p className="font-mono text-xs text-zinc-400">
+            Syncing Cloud Protocol...
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-8 py-8 sm:py-12 relative z-10 space-y-8">
-      {/* ============================================================ */}
       {/* HEADER & SCORE SECTION */}
-      {/* ============================================================ */}
       <header className="relative overflow-hidden rounded-3xl bg-zinc-900/60 border border-white/[0.08] backdrop-blur-xl p-6 sm:p-8 shadow-[0_8px_32px_rgba(0,0,0,0.4)]">
         <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-6">
-          {/* Left info */}
           <div className="space-y-3">
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-2 px-3 py-1 rounded-full bg-violet-500/10 border border-violet-500/20 text-violet-300 font-mono text-xs">
@@ -921,7 +987,7 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
             </div>
           </div>
 
-          {/* Right: Productivity Score Gauge */}
+          {/* Productivity Score Gauge */}
           <div className="w-full lg:w-80 bg-black/50 border border-white/10 rounded-2xl p-5 backdrop-blur-md relative overflow-hidden group">
             <div className="flex items-start justify-between mb-3">
               <div>
@@ -949,7 +1015,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
               </div>
             </div>
 
-            {/* Dynamic Progress Bar */}
             <div className="h-3 w-full bg-zinc-800/80 rounded-full overflow-hidden p-0.5 border border-white/10 relative">
               <motion.div
                 initial={{ width: 0 }}
@@ -987,7 +1052,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
 
         {/* Action Toolbar */}
         <div className="flex flex-wrap items-center justify-between gap-4 mt-6 pt-6 border-t border-white/[0.06]">
-          {/* Day Selector Tabs */}
           <div className="flex items-center gap-1.5 p-1 bg-black/40 border border-white/10 rounded-xl overflow-x-auto max-w-full">
             {DAYS_SHORT.map((day, idx) => {
               const isToday = idx === todayIndex;
@@ -1019,7 +1083,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
             })}
           </div>
 
-          {/* Quick Buttons */}
           <div className="flex items-center gap-3">
             <motion.button
               whileHover={{ scale: 1.03 }}
@@ -1054,9 +1117,7 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
         </div>
       </header>
 
-      {/* ============================================================ */}
-      {/* ACTIVE BLOCK BANNER (IF CURRENT BLOCK IS ACTIVE) */}
-      {/* ============================================================ */}
+      {/* ACTIVE BLOCK BANNER */}
       {isSelectedDayToday && currentActiveTask && (
         <motion.div
           initial={{ opacity: 0, y: -10 }}
@@ -1130,9 +1191,7 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
         </motion.div>
       )}
 
-      {/* ============================================================ */}
       {/* FULL TIMETABLE SCHEDULE */}
-      {/* ============================================================ */}
       <div className="space-y-4">
         <div className="flex items-center justify-between px-2">
           <div className="flex items-center gap-2">
@@ -1155,7 +1214,18 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
           </div>
         </div>
 
-        {currentDayTasks.length === 0 ? (
+        {loadingTasks ? (
+          <div className="text-center py-20 bg-zinc-900/30 border border-white/5 rounded-3xl">
+            <motion.div
+              className="w-10 h-10 rounded-full border-2 border-violet-500/20 border-t-violet-500 mx-auto"
+              animate={{ rotate: 360 }}
+              transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+            />
+            <p className="text-zinc-500 text-xs font-mono mt-3">
+              Loading Blocks from Cloud...
+            </p>
+          </div>
+        ) : currentDayTasks.length === 0 ? (
           <div className="text-center py-20 bg-zinc-900/30 border border-dashed border-white/10 rounded-3xl">
             <Calendar className="w-12 h-12 text-zinc-600 mx-auto mb-3" />
             <h3 className="text-lg font-bold text-white">
@@ -1179,7 +1249,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
                 isSelectedDayToday &&
                 currentTime >= task.startTime &&
                 currentTime < task.endTime;
-              const isPast = isSelectedDayToday && currentTime >= task.endTime;
               const style = getCategoryStyles(task.type, isCurrent);
 
               return (
@@ -1198,7 +1267,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
                         : "bg-zinc-900/50 border-white/[0.08] hover:border-white/20 hover:bg-zinc-900/70",
                   )}
                 >
-                  {/* Timeline Dot Indicator */}
                   <div
                     className={cn(
                       "absolute -left-[1.65rem] sm:-left-[2.65rem] top-6 w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all",
@@ -1218,7 +1286,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
                     )}
                   </div>
 
-                  {/* Interactive Checkbox */}
                   <button
                     onClick={() => toggleTask(task.id)}
                     className={cn(
@@ -1238,11 +1305,9 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
                     )}
                   </button>
 
-                  {/* Task Content Body */}
                   <div className="flex-1 min-w-0">
                     <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
                       <div className="flex items-center gap-2">
-                        {/* Time interval chip */}
                         <span
                           className={cn(
                             "px-2.5 py-0.5 rounded-md font-mono text-xs font-semibold",
@@ -1260,10 +1325,9 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
                       </div>
 
                       <div className="flex items-center gap-2">
-                        {/* Category tag */}
                         <span
                           className={cn(
-                            "px-2 py-0.5 rounded-text-[11px] font-mono border flex items-center gap-1.5",
+                            "px-2 py-0.5 rounded text-[11px] font-mono border flex items-center gap-1.5",
                             style.badge,
                           )}
                         >
@@ -1277,7 +1341,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
                           </span>
                         )}
 
-                        {/* Delete block */}
                         <button
                           onClick={() => deleteTask(task.id)}
                           className="opacity-0 group-hover:opacity-100 text-zinc-600 hover:text-red-400 p-1 transition-opacity"
@@ -1312,7 +1375,6 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
                       </p>
                     )}
 
-                    {/* Active Block Progress Mini-Ruler */}
                     {isCurrent && (
                       <div className="mt-3 pt-3 border-t border-violet-500/20 flex items-center justify-between text-xs font-mono text-violet-300">
                         <span className="flex items-center gap-2">
@@ -1336,9 +1398,7 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
         )}
       </div>
 
-      {/* ============================================================ */}
       {/* QUICK ADD MODAL */}
-      {/* ============================================================ */}
       <AnimatePresence>
         {isAddModalOpen && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
@@ -1476,50 +1536,95 @@ function TimeblockTimetableDashboard({ onConfigure, onLogout }) {
 }
 
 // ==========================================
-// 2. MASTER SETUP WIZARD (CONFIGURATION)
+// 2. MASTER SETUP WIZARD (FIRESTORE SYNC)
 // ==========================================
-function MasterSetupWizard({ onComplete, onCancel }) {
+function MasterSetupWizard({ user, onComplete, onCancel }) {
   const [step, setStep] = useState(1);
+  const [loadingConfig, setLoadingConfig] = useState(true);
   const [isSynthesizing, setIsSynthesizing] = useState(false);
 
-  const [commitments, setCommitments] = useState(() => {
-    const saved = localStorage.getItem("mindfulOS_config");
-    return saved ? JSON.parse(saved).commitments : DEFAULT_CONFIG.commitments;
-  });
+  const [commitments, setCommitments] = useState(DEFAULT_CONFIG.commitments);
+  const [training, setTraining] = useState(DEFAULT_CONFIG.training);
+  const [recovery, setRecovery] = useState(DEFAULT_CONFIG.recovery);
 
-  const [training, setTraining] = useState(() => {
-    const saved = localStorage.getItem("mindfulOS_config");
-    return saved ? JSON.parse(saved).training : DEFAULT_CONFIG.training;
-  });
+  useEffect(() => {
+    if (!user) return;
+    let isMounted = true;
 
-  const [recovery, setRecovery] = useState(() => {
-    const saved = localStorage.getItem("mindfulOS_config");
-    return saved ? JSON.parse(saved).recovery : DEFAULT_CONFIG.recovery;
-  });
+    async function fetchUserConfig() {
+      try {
+        const cfgSnap = await getDoc(
+          doc(db, "users", user.uid, "config", "main"),
+        );
+        if (cfgSnap.exists()) {
+          const data = cfgSnap.data();
+          if (isMounted) {
+            if (data.commitments) setCommitments(data.commitments);
+            if (data.training) setTraining(data.training);
+            if (data.recovery) setRecovery(data.recovery);
+          }
+        }
+      } catch (err) {
+        console.error("Error fetching wizard config from Firestore:", err);
+      } finally {
+        if (isMounted) setLoadingConfig(false);
+      }
+    }
+
+    fetchUserConfig();
+    return () => {
+      isMounted = false;
+    };
+  }, [user]);
 
   const nextStep = () => setStep((s) => Math.min(4, s + 1));
   const prevStep = () => setStep((s) => Math.max(1, s - 1));
 
-  const handleSynthesize = () => {
+  const handleSynthesize = async () => {
     setIsSynthesizing(true);
     setStep(4);
-    setTimeout(() => {
-      setIsSynthesizing(false);
-      localStorage.setItem(
-        "mindfulOS_config",
-        JSON.stringify({ commitments, training, recovery }),
-      );
-      // Clear generated days to re-synthesize with new config
-      DAYS_SHORT.forEach((_, idx) => {
-        localStorage.removeItem(`mindfulOS_tasks_day_${idx}`);
-      });
-    }, 1500);
+
+    try {
+      if (user) {
+        // Save Master Configuration
+        await setDoc(doc(db, "users", user.uid, "config", "main"), {
+          commitments,
+          training,
+          recovery,
+        });
+
+        // Clear existing generated daily tasks so they re-synthesize cleanly
+        const clearPromises = DAYS_SHORT.map((_, idx) =>
+          setDoc(doc(db, "users", user.uid, "dailyTasks", String(idx)), {
+            tasks: null,
+          }),
+        );
+        await Promise.all(clearPromises);
+      }
+    } catch (err) {
+      console.error("Error saving synthesized protocol:", err);
+    } finally {
+      setTimeout(() => {
+        setIsSynthesizing(false);
+      }, 1200);
+    }
   };
+
+  if (loadingConfig) {
+    return (
+      <div className="min-h-screen flex items-center justify-center p-4">
+        <motion.div
+          className="w-12 h-12 rounded-full border-4 border-violet-500/20 border-t-violet-500"
+          animate={{ rotate: 360 }}
+          transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+        />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4 sm:p-8 relative z-10">
       <div className="w-full max-w-2xl bg-zinc-900/80 border border-white/10 rounded-3xl p-6 sm:p-10 backdrop-blur-2xl shadow-2xl">
-        {/* Header & Steps */}
         <div className="flex items-center justify-between mb-8 pb-6 border-b border-white/10">
           <div>
             <span className="text-[11px] font-mono text-violet-400 uppercase tracking-widest">
@@ -1541,7 +1646,6 @@ function MasterSetupWizard({ onComplete, onCancel }) {
           </button>
         </div>
 
-        {/* Wizard Steps */}
         <AnimatePresence mode="wait">
           {step === 1 && (
             <motion.div
@@ -1893,7 +1997,8 @@ function MasterSetupWizard({ onComplete, onCancel }) {
                 <div className="space-y-4">
                   <div className="w-16 h-16 rounded-full border-4 border-violet-500/20 border-t-violet-500 animate-spin mx-auto" />
                   <p className="font-mono text-sm text-zinc-400 animate-pulse">
-                    Synthesizing weekly time-block protocol...
+                    Synthesizing weekly time-block protocol to Cloud
+                    Firestore...
                   </p>
                 </div>
               ) : (
@@ -1905,8 +2010,8 @@ function MasterSetupWizard({ onComplete, onCancel }) {
                     Protocol Generated Successfully!
                   </h3>
                   <p className="text-xs font-mono text-zinc-400 max-w-sm mx-auto">
-                    Your timetable has been calculated and synced across all 7
-                    days.
+                    Your timetable has been calculated and saved to your cloud
+                    account across all 7 days.
                   </p>
                   <button
                     onClick={onComplete}
@@ -1920,7 +2025,6 @@ function MasterSetupWizard({ onComplete, onCancel }) {
           )}
         </AnimatePresence>
 
-        {/* Footer Navigation */}
         {step < 4 && (
           <div className="flex justify-between items-center mt-8 pt-6 border-t border-white/10">
             <button

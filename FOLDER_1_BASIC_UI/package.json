@@ -11,12 +11,12 @@
   "dependencies": {
     "@vitejs/plugin-react": "latest",
     "clsx": "latest",
+    "firebase": "^12.19.0",
     "framer-motion": "latest",
     "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
     "tailwind-merge": "latest",
     "vite": "latest"
-  },
-  "devDependencies": {}
+  }
 }
